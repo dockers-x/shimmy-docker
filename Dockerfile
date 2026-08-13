@@ -18,7 +18,10 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes \
         ca-certificates \
+        libdrm2 \
         libssl3 \
+        libvulkan1 \
+        mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --home-dir /app --uid 10001 shimmy \
     && mkdir -p /app/models \
@@ -31,8 +34,8 @@ WORKDIR /app
 EXPOSE 11434
 
 ENV SHIMMY_BASE_GGUF=/app/models \
-    SHIMMY_HOST=0.0.0.0 \
-    SHIMMY_PORT=11434
+    SHIMMY_BIND_ADDRESS=0.0.0.0:11434 \
+    WGPU_BACKEND=vulkan
 
 VOLUME ["/app/models"]
 ENTRYPOINT ["shimmy"]

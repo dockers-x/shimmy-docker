@@ -9,6 +9,11 @@ on:
         description: Upstream Shimmy tag (leave empty for latest release)
         required: false
         type: string
+      force_rebuild:
+        description: Rebuild an already-published upstream version
+        required: false
+        default: false
+        type: boolean
   push:
     tags: ["v*.*.*"]
 
@@ -71,9 +76,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild || false }}
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "push" || "${FORCE_REBUILD}" == "true" ]]; then
             should_build=true
           elif gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
             should_build=false
@@ -172,6 +178,9 @@ jobs:
           test "${version}" = "${EXPECTED_VERSION}"
           test "$(git -C upstream rev-parse HEAD)" = "${EXPECTED_COMMIT}"
 
+      - name: Apply maintained container definition
+        run: cp Dockerfile upstream/Dockerfile
+
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -240,13 +249,13 @@ jobs:
           )
           for image in "${images[@]}"; do
             docker buildx imagetools create \
-              --tag "${image}:latest" \
-              --tag "${image}:${VERSION}" \
-              --tag "${image}:${major_minor}" \
-              --tag "${image}:${major}" \
+              --tag "${image}:vulkan" \
+              --tag "${image}:${VERSION}-vulkan" \
+              --tag "${image}:${major_minor}-vulkan" \
+              --tag "${image}:${major}-vulkan" \
               "${image}:build-${UPSTREAM_COMMIT}-${BUILD_ID}-amd64" \
               "${image}:build-${UPSTREAM_COMMIT}-${BUILD_ID}-arm64"
-            docker buildx imagetools inspect --raw "${image}:${VERSION}" \
+            docker buildx imagetools inspect --raw "${image}:${VERSION}-vulkan" \
               | jq -e '
                   [.manifests[]?.platform
                     | select(.os == "linux")
