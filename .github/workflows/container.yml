@@ -1,0 +1,256 @@
+name: Container images
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Upstream Shimmy tag (leave empty for latest release)
+        required: false
+        type: string
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-${{ github.ref_name }}-${{ inputs.upstream_tag || 'latest' }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      commit: ${{ steps.release.outputs.commit }}
+      should_build: ${{ steps.existing.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve and verify upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          repository="Michael-A-Kuykendall/shimmy"
+          tag="${REQUESTED_TAG}"
+          if [[ -z "${tag}" ]]; then
+            tag="$(gh api "repos/${repository}/releases/latest" --jq .tag_name)"
+          fi
+          [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+          object="$(gh api "repos/${repository}/git/ref/tags/${tag}" --jq '.object.type + " " + .object.sha')"
+          read -r object_type object_sha <<<"${object}"
+          if [[ "${object_type}" == "tag" ]]; then
+            commit="$(gh api "repos/${repository}/git/tags/${object_sha}" --jq .object.sha)"
+          elif [[ "${object_type}" == "commit" ]]; then
+            commit="${object_sha}"
+          else
+            echo "Unsupported upstream tag object: ${object_type}" >&2
+            exit 1
+          fi
+          [[ "${commit}" =~ ^[0-9a-f]{40}$ ]]
+
+          version="${tag#v}"
+          echo "tag=${tag}" >>"${GITHUB_OUTPUT}"
+          echo "version=${version}" >>"${GITHUB_OUTPUT}"
+          echo "commit=${commit}" >>"${GITHUB_OUTPUT}"
+
+      - name: Check whether the version is already published
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            should_build=true
+          elif gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            should_build=false
+          else
+            should_build=true
+          fi
+          echo "should_build=${should_build}" >>"${GITHUB_OUTPUT}"
+
+  test:
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out pinned upstream source
+        uses: actions/checkout@v7
+        with:
+          repository: Michael-A-Kuykendall/shimmy
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+
+      - name: Verify source version and revision
+        env:
+          EXPECTED_VERSION: ${{ needs.resolve.outputs.version }}
+          EXPECTED_COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test "${version}" = "${EXPECTED_VERSION}"
+          test "$(git rev-parse HEAD)" = "${EXPECTED_COMMIT}"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: shimmy-upstream
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --all-targets --all-features --locked
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: Build ${{ matrix.platform }} image
+    needs: [resolve, test]
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            platform_tag: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            platform_tag: arm64
+    env:
+      BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out pinned upstream source
+        uses: actions/checkout@v7
+        with:
+          repository: Michael-A-Kuykendall/shimmy
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+
+      - name: Verify source version
+        env:
+          EXPECTED_VERSION: ${{ needs.resolve.outputs.version }}
+          EXPECTED_COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test "${version}" = "${EXPECTED_VERSION}"
+          test "$(git rev-parse HEAD)" = "${EXPECTED_COMMIT}"
+
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push native image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            docker.io/czyt/shimmy:build-${{ needs.resolve.outputs.commit }}-${{ env.BUILD_ID }}-${{ matrix.platform_tag }}
+            ghcr.io/dockers-x/shimmy:build-${{ needs.resolve.outputs.commit }}-${{ env.BUILD_ID }}-${{ matrix.platform_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/Michael-A-Kuykendall/shimmy
+            org.opencontainers.image.version=${{ needs.resolve.outputs.tag }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.commit }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha,scope=shimmy-${{ matrix.platform_tag }}
+          cache-to: type=gha,mode=max,scope=shimmy-${{ matrix.platform_tag }}
+          provenance: true
+          sbom: true
+
+  publish:
+    name: Publish multi-platform manifests
+    needs: [resolve, build]
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      UPSTREAM_COMMIT: ${{ needs.resolve.outputs.commit }}
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and verify manifests
+        run: |
+          set -euo pipefail
+          major_minor="${VERSION%.*}"
+          major="${VERSION%%.*}"
+          images=(
+            "docker.io/czyt/shimmy"
+            "ghcr.io/dockers-x/shimmy"
+          )
+          for image in "${images[@]}"; do
+            docker buildx imagetools create \
+              --tag "${image}:latest" \
+              --tag "${image}:${VERSION}" \
+              --tag "${image}:${major_minor}" \
+              --tag "${image}:${major}" \
+              "${image}:build-${UPSTREAM_COMMIT}-${BUILD_ID}-amd64" \
+              "${image}:build-${UPSTREAM_COMMIT}-${BUILD_ID}-arm64"
+            docker buildx imagetools inspect --raw "${image}:${VERSION}" \
+              | jq -e '
+                  [.manifests[]?.platform
+                    | select(.os == "linux")
+                    | .architecture] as $architectures
+                  | ($architectures | index("amd64")) != null
+                    and ($architectures | index("arm64")) != null
+                ' >/dev/null
+          done
+
+      - name: Record successfully published upstream version
+        if: github.event_name != 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            head_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha)"
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${TAG}" -f sha="${head_sha}" >/dev/null
+          fi
