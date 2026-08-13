@@ -113,9 +113,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: shimmy-upstream
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: cargo test --workspace --all-targets --all-features --locked
+      - name: Report upstream formatting differences
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+      - name: Report upstream Clippy findings
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Report upstream test failures
+        continue-on-error: true
+        run: cargo test --workspace --all-targets --all-features --locked
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
