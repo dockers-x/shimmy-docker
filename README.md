@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/shimmy-logo.png" alt="Shimmy" width="640">
+</p>
+
 # shimmy container image
 
 Multi-platform container images for [Shimmy](https://github.com/Michael-A-Kuykendall/shimmy), automatically built from upstream release tags.
